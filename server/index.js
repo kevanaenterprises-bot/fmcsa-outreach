@@ -29,12 +29,10 @@ async function initDB() {
       mc_number VARCHAR(20),
       company_name VARCHAR(255),
       phone VARCHAR(30),
-      email VARCHAR(255),
       city VARCHAR(100),
       state VARCHAR(10),
       truck_count INT,
       application_date DATE,
-      has_email BOOLEAN GENERATED ALWAYS AS (email IS NOT NULL AND email != '') STORED,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS outreach_log (
@@ -186,6 +184,28 @@ async function sendFollowUpEmail(carrier) {
   console.log(`[Email] Follow-up sent to ${carrier.company_name}`);
 }
 
+// ── SAFER Phone Scraper ───────────────────────────────────────────────────────
+async function scrapePhoneFromSAFER(dotNumber) {
+  try {
+    const url = `https://safer.fmcsa.dot.gov/query.asp?searchtype=ANY&query_type=queryCarrierSnapshot&query_param=USDOT&query_string=${dotNumber}`;
+    const res = await axios.get(url, {
+      timeout: 10000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LoadTrackerPro-Outreach/1.0)' },
+    });
+    const html = res.data;
+    // Phone appears as: <td>Phone:</td><td>...</td> or similar table cell
+    const phoneMatch = html.match(/Phone[:\s]*<\/td>\s*<td[^>]*>\s*([\d\s\-\(\)\.]+)/i)
+      || html.match(/(\(\d{3}\)\s*\d{3}[-\s]\d{4})/);
+    if (phoneMatch) {
+      const phone = phoneMatch[1].trim().replace(/\s+/g, ' ');
+      if (phone.replace(/\D/g, '').length >= 10) return phone;
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // ── FMCSA Poller ──────────────────────────────────────────────────────────────
 const FMCSA_API = 'https://mobile.fmcsa.dot.gov/qc/services';
 // New carriers in 2026 are around DOT# 4,300,000+. Override with START_DOT_NUMBER env var.
@@ -220,41 +240,24 @@ async function pollFMCSA() {
         const companyName = c.legalName || c.dbaName;
         if (!companyName) continue;
 
-        // Fetch basics for phone/email
-        let phone = null, email = null;
-        try {
-          const basicsRes = await axios.get(`${FMCSA_API}/carriers/${dot}/basics?webKey=${webKey}`, { timeout: 8000 });
-          const basics = basicsRes.data?.content?.basics || basicsRes.data?.content;
-          if (basics) {
-            phone = basics.telephone || basics.phoneNumber || null;
-            email = basics.emailAddress || basics.email || null;
-          }
-        } catch (_) {}
+        // Scrape phone from SAFER (QCMobile API doesn't expose contact info)
+        const phone = await scrapePhoneFromSAFER(dot);
 
         const state = c.phyState || null;
         const city = c.phyCity || null;
         const trucks = c.totalPowerUnits ? parseInt(c.totalPowerUnits) : null;
 
         const result = await pool.query(
-          `INSERT INTO carriers (dot_number, company_name, phone, email, city, state, truck_count, application_date)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+          `INSERT INTO carriers (dot_number, company_name, phone, city, state, truck_count, application_date)
+           VALUES ($1,$2,$3,$4,$5,$6,NOW())
            ON CONFLICT (dot_number) DO NOTHING
            RETURNING id`,
-          [String(dot), companyName, phone, email, city, state, trucks]
+          [String(dot), companyName, phone, city, state, trucks]
         );
 
         if (result.rows.length > 0) {
           found++;
-          console.log(`[FMCSA] New: ${companyName} (DOT ${dot}${email ? ', email: ' + email : ', no email'})`);
-          if (email) {
-            const already = await pool.query(
-              `SELECT id FROM outreach_log WHERE carrier_id=$1 AND type='email'`, [result.rows[0].id]
-            );
-            if (already.rows.length === 0) {
-              const carrier = await pool.query(`SELECT * FROM carriers WHERE id=$1`, [result.rows[0].id]);
-              await sendOutreachEmail(carrier.rows[0]);
-            }
-          }
+          console.log(`[FMCSA] New: ${companyName} (DOT ${dot}${phone ? ', phone: ' + phone : ', no phone'})`);
         }
       } catch (err) {
         if (err.response?.status !== 404) {
@@ -296,8 +299,7 @@ app.get('/api/call-queue', async (req, res) => {
       SELECT c.*, cn.call_status, cn.notes as call_notes
       FROM carriers c
       LEFT JOIN call_notes cn ON cn.carrier_id = c.id
-      WHERE c.email IS NULL OR c.email = ''
-      ORDER BY c.application_date DESC, c.created_at DESC
+      ORDER BY c.created_at DESC
     `);
     res.json(result.rows);
   } catch (err) {
@@ -363,17 +365,17 @@ app.post('/api/poll', async (req, res) => {
 // Stats
 app.get('/api/stats', async (req, res) => {
   try {
-    const [total, emailed, called, followUp] = await Promise.all([
+    const [total, withPhone, called, interested] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM carriers'),
-      pool.query("SELECT COUNT(*) FROM outreach_log WHERE type='email' AND status='sent'"),
-      pool.query("SELECT COUNT(*) FROM call_notes WHERE call_status != 'pending'"),
-      pool.query("SELECT COUNT(*) FROM outreach_log WHERE status='follow_up_sent'"),
+      pool.query("SELECT COUNT(*) FROM carriers WHERE phone IS NOT NULL AND phone != ''"),
+      pool.query("SELECT COUNT(*) FROM call_notes WHERE call_status NOT IN ('pending')"),
+      pool.query("SELECT COUNT(*) FROM call_notes WHERE call_status IN ('interested','converted')"),
     ]);
     res.json({
       total: parseInt(total.rows[0].count),
-      emailed: parseInt(emailed.rows[0].count),
+      withPhone: parseInt(withPhone.rows[0].count),
       called: parseInt(called.rows[0].count),
-      followUpSent: parseInt(followUp.rows[0].count),
+      interested: parseInt(interested.rows[0].count),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
