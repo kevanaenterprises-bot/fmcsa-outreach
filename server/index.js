@@ -25,8 +25,8 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS carriers (
       id SERIAL PRIMARY KEY,
-      mc_number VARCHAR(20) UNIQUE,
-      dot_number VARCHAR(20),
+      dot_number VARCHAR(20) UNIQUE,
+      mc_number VARCHAR(20),
       company_name VARCHAR(255),
       phone VARCHAR(30),
       email VARCHAR(255),
@@ -188,13 +188,13 @@ async function sendFollowUpEmail(carrier) {
 
 // ── FMCSA Poller ──────────────────────────────────────────────────────────────
 const FMCSA_API = 'https://mobile.fmcsa.dot.gov/qc/services';
-// Default starting MC — adjust START_MC_NUMBER env var if needed
-const DEFAULT_START_MC = 1380000;
-const SCAN_BATCH = 150; // MC numbers to scan per poll
+// New carriers in 2026 are around DOT# 4,300,000+. Override with START_DOT_NUMBER env var.
+const DEFAULT_START_DOT = 4300000;
+const SCAN_BATCH = 200;
 
-async function getLastScannedMC() {
-  const r = await pool.query(`SELECT MAX(CAST(mc_number AS BIGINT)) as max_mc FROM carriers WHERE mc_number ~ '^[0-9]+$'`);
-  return r.rows[0].max_mc ? parseInt(r.rows[0].max_mc) : (parseInt(process.env.START_MC_NUMBER) || DEFAULT_START_MC);
+async function getLastScannedDOT() {
+  const r = await pool.query(`SELECT MAX(CAST(dot_number AS BIGINT)) as max_dot FROM carriers WHERE dot_number ~ '^[0-9]+$'`);
+  return r.rows[0].max_dot ? parseInt(r.rows[0].max_dot) : (parseInt(process.env.START_DOT_NUMBER) || DEFAULT_START_DOT);
 }
 
 async function pollFMCSA() {
@@ -206,19 +206,19 @@ async function pollFMCSA() {
   }
 
   try {
-    const startMC = await getLastScannedMC();
-    const endMC = startMC + SCAN_BATCH;
-    console.log(`[FMCSA] Scanning MC# ${startMC} → ${endMC}`);
+    const startDOT = await getLastScannedDOT();
+    const endDOT = startDOT + SCAN_BATCH;
+    console.log(`[FMCSA] Scanning DOT# ${startDOT} → ${endDOT}`);
 
     let found = 0;
-    for (let mc = startMC; mc <= endMC; mc++) {
+    for (let dot = startDOT; dot <= endDOT; dot++) {
       try {
-        const url = `${FMCSA_API}/carriers/docket-number/${mc}?webKey=${webKey}`;
+        const url = `${FMCSA_API}/carriers/${dot}?webKey=${webKey}`;
         const res = await axios.get(url, { timeout: 10000 });
         const content = res.data?.content;
         if (!content || content.length === 0) continue;
 
-        const c = content[0];
+        const c = Array.isArray(content) ? content[0] : content;
         const companyName = c.legalName || c.dbaName;
         if (!companyName) continue;
 
@@ -226,19 +226,20 @@ async function pollFMCSA() {
         const phone = c.telephone || null;
         const state = c.phyState || c.mailingState || null;
         const city = c.phyCity || c.mailingCity || null;
-        const dot = c.dotNumber ? String(c.dotNumber) : null;
+        const mc = c.docketNumber ? String(c.docketNumber) : null;
         const trucks = c.totalPowerUnits ? parseInt(c.totalPowerUnits) : null;
 
         const result = await pool.query(
-          `INSERT INTO carriers (mc_number, dot_number, company_name, phone, email, city, state, truck_count, application_date)
+          `INSERT INTO carriers (dot_number, mc_number, company_name, phone, email, city, state, truck_count, application_date)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-           ON CONFLICT (mc_number) DO NOTHING
+           ON CONFLICT (dot_number) DO NOTHING
            RETURNING id`,
-          [String(mc), dot, companyName, phone, email, city, state, trucks]
+          [String(dot), mc, companyName, phone, email, city, state, trucks]
         );
 
         if (result.rows.length > 0) {
           found++;
+          console.log(`[FMCSA] New carrier: ${companyName} (DOT ${dot}${email ? ', has email' : ', no email'})`);
           if (email) {
             const already = await pool.query(
               `SELECT id FROM outreach_log WHERE carrier_id=$1 AND type='email'`, [result.rows[0].id]
@@ -251,14 +252,13 @@ async function pollFMCSA() {
         }
       } catch (err) {
         if (err.response?.status !== 404) {
-          console.error(`[FMCSA] MC ${mc} error:`, err.message);
+          console.error(`[FMCSA] DOT ${dot} error:`, err.message);
         }
       }
-      // Small delay to avoid hammering the API
       await new Promise(r => setTimeout(r, 100));
     }
 
-    console.log(`[FMCSA] Poll complete — ${found} new carriers found (scanned MC ${startMC}–${endMC})`);
+    console.log(`[FMCSA] Poll complete — ${found} new carriers found (scanned DOT ${startDOT}–${endDOT})`);
     await sendPendingFollowUps();
 
   } catch (err) {
