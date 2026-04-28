@@ -396,7 +396,7 @@ cron.schedule('0 6,12,18,0 * * *', () => {
 // ── Static frontend ───────────────────────────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 app.use(express.static(join(__dirname, '../dist')));
-app.get('*', (req, res) => {
+app.get('/{*splat}', (req, res) => {
   res.sendFile(join(__dirname, '../dist/index.html'));
 });
 
