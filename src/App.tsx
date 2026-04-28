@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Phone, Mail, RefreshCw, Users, CheckCircle, Clock, ChevronDown, ChevronUp } from 'lucide-react';
 
-const API = import.meta.env.VITE_API_URL || 'http://localhost:3002';
+const API = import.meta.env.VITE_API_URL || window.location.origin;
 
 type Carrier = {
   id: number; mc_number: string; dot_number: string; company_name: string;

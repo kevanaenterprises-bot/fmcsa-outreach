@@ -5,6 +5,8 @@ import nodemailer from 'nodemailer';
 import cron from 'node-cron';
 import axios from 'axios';
 import xml2js from 'xml2js';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
 const { Pool } = pg;
 const app = express();
@@ -390,6 +392,13 @@ cron.schedule('0 6,12,18,0 * * *', () => {
   console.log('[Cron] Triggered FMCSA poll');
   pollFMCSA();
 }, { timezone: 'America/Chicago' });
+
+// ── Static frontend ───────────────────────────────────────────────────────────
+const __dirname = dirname(fileURLToPath(import.meta.url));
+app.use(express.static(join(__dirname, '../dist')));
+app.get('*', (req, res) => {
+  res.sendFile(join(__dirname, '../dist/index.html'));
+});
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 initDB().then(() => {
