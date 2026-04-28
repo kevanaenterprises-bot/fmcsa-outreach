@@ -39,9 +39,9 @@ function CallCard({ carrier, onUpdate }: { carrier: Carrier; onUpdate: () => voi
     <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
       <div className="p-4 flex items-center justify-between cursor-pointer hover:bg-slate-50" onClick={() => setExpanded(!expanded)}>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-3 flex-wrap">
-            <span className="font-semibold text-slate-900">{carrier.company_name}</span>
-            <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${CALL_STATUSES.find(x => x.value === (carrier.call_status || 'pending'))?.color}`}>
+          <div className="flex items-start gap-3 flex-wrap">
+            <span className="font-semibold text-slate-900 leading-tight">{carrier.company_name}</span>
+            <span className={`px-2.5 py-0.5 rounded-full text-xs font-semibold flex-shrink-0 ${CALL_STATUSES.find(x => x.value === (carrier.call_status || 'pending'))?.color}`}>
               {CALL_STATUSES.find(x => x.value === (carrier.call_status || 'pending'))?.label}
             </span>
           </div>
