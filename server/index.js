@@ -187,72 +187,78 @@ async function sendFollowUpEmail(carrier) {
 }
 
 // ── FMCSA Poller ──────────────────────────────────────────────────────────────
+const FMCSA_API = 'https://mobile.fmcsa.dot.gov/qc/services';
+// Default starting MC — adjust START_MC_NUMBER env var if needed
+const DEFAULT_START_MC = 1380000;
+const SCAN_BATCH = 150; // MC numbers to scan per poll
+
+async function getLastScannedMC() {
+  const r = await pool.query(`SELECT MAX(CAST(mc_number AS BIGINT)) as max_mc FROM carriers WHERE mc_number ~ '^[0-9]+$'`);
+  return r.rows[0].max_mc ? parseInt(r.rows[0].max_mc) : (parseInt(process.env.START_MC_NUMBER) || DEFAULT_START_MC);
+}
+
 async function pollFMCSA() {
   console.log('[FMCSA] Polling for new carriers...');
+  const webKey = process.env.FMCSA_WEBKEY;
+  if (!webKey) {
+    console.error('[FMCSA] FMCSA_WEBKEY not set — skipping poll');
+    return;
+  }
+
   try {
-    // Query FMCSA L&I system for new entrants from the last 7 days
-    const toDate = new Date();
-    const fromDate = new Date();
-    fromDate.setDate(fromDate.getDate() - 7);
+    const startMC = await getLastScannedMC();
+    const endMC = startMC + SCAN_BATCH;
+    console.log(`[FMCSA] Scanning MC# ${startMC} → ${endMC}`);
 
-    const fmt = (d) => `${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}/${d.getFullYear()}`;
+    let found = 0;
+    for (let mc = startMC; mc <= endMC; mc++) {
+      try {
+        const url = `${FMCSA_API}/carriers/docket-number/${mc}?webKey=${webKey}`;
+        const res = await axios.get(url, { timeout: 10000 });
+        const content = res.data?.content;
+        if (!content || content.length === 0) continue;
 
-    const url = `https://li-public.fmcsa.dot.gov/LIVIEW/pkg_carrquery.prc_carrlist?pv_vpath=LIVIEW&pn_seqnum=&pv_snap_requested=N&pv_typequery=S&pv_usdot_num=&pv_mc_num=&pv_first_name=&pv_last_name=&pv_comp_name=&pv_state=&pv_eff_date_from=${fmt(fromDate)}&pv_eff_date_to=${fmt(toDate)}&pv_oper_auth_type=CARRIER`;
+        const c = content[0];
+        const companyName = c.legalName || c.dbaName;
+        if (!companyName) continue;
 
-    const response = await axios.get(url, {
-      timeout: 30000,
-      headers: { 'User-Agent': 'LoadTrackerPro-Outreach/1.0 (kevin@turtlelogisticsllc.com)' },
-    });
+        const email = c.emailAddress || null;
+        const phone = c.telephone || null;
+        const state = c.phyState || c.mailingState || null;
+        const city = c.phyCity || c.mailingCity || null;
+        const dot = c.dotNumber ? String(c.dotNumber) : null;
+        const trucks = c.totalPowerUnits ? parseInt(c.totalPowerUnits) : null;
 
-    // Parse the HTML response to extract carrier data
-    const html = response.data;
-    const rows = [];
+        const result = await pool.query(
+          `INSERT INTO carriers (mc_number, dot_number, company_name, phone, email, city, state, truck_count, application_date)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+           ON CONFLICT (mc_number) DO NOTHING
+           RETURNING id`,
+          [String(mc), dot, companyName, phone, email, city, state, trucks]
+        );
 
-    // Extract table rows with carrier data using regex on the HTML
-    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-    const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
-    const stripTags = (s) => s.replace(/<[^>]+>/g, '').trim();
-
-    let match;
-    while ((match = rowRegex.exec(html)) !== null) {
-      const rowHtml = match[1];
-      const cells = [];
-      let cellMatch;
-      while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
-        cells.push(stripTags(cellMatch[1]));
+        if (result.rows.length > 0) {
+          found++;
+          if (email) {
+            const already = await pool.query(
+              `SELECT id FROM outreach_log WHERE carrier_id=$1 AND type='email'`, [result.rows[0].id]
+            );
+            if (already.rows.length === 0) {
+              const carrier = await pool.query(`SELECT * FROM carriers WHERE id=$1`, [result.rows[0].id]);
+              await sendOutreachEmail(carrier.rows[0]);
+            }
+          }
+        }
+      } catch (err) {
+        if (err.response?.status !== 404) {
+          console.error(`[FMCSA] MC ${mc} error:`, err.message);
+        }
       }
-      if (cells.length >= 4 && cells[0].match(/^\d+$/)) {
-        rows.push(cells);
-      }
+      // Small delay to avoid hammering the API
+      await new Promise(r => setTimeout(r, 100));
     }
 
-    console.log(`[FMCSA] Found ${rows.length} new carrier rows`);
-
-    for (const cells of rows) {
-      const mcNumber = cells[0] || null;
-      const companyName = cells[1] || null;
-      const state = cells[2] || null;
-      const appDate = cells[3] || null;
-
-      if (!mcNumber || !companyName) continue;
-
-      // Insert carrier, skip if already exists
-      const result = await pool.query(
-        `INSERT INTO carriers (mc_number, company_name, state, application_date)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (mc_number) DO NOTHING
-         RETURNING id`,
-        [mcNumber, companyName, state, appDate || new Date()]
-      );
-
-      if (result.rows.length > 0 && result.rows[0].id) {
-        const carrierId = result.rows[0].id;
-        // Try to fetch more details for this carrier
-        await fetchCarrierDetails(carrierId, mcNumber);
-      }
-    }
-
-    // Send follow-ups for carriers emailed 7+ days ago
+    console.log(`[FMCSA] Poll complete — ${found} new carriers found (scanned MC ${startMC}–${endMC})`);
     await sendPendingFollowUps();
 
   } catch (err) {
@@ -260,42 +266,6 @@ async function pollFMCSA() {
   }
 }
 
-async function fetchCarrierDetails(carrierId, mcNumber) {
-  try {
-    const url = `https://li-public.fmcsa.dot.gov/LIVIEW/pkg_carrquery.prc_carrdetail?pv_vpath=LIVIEW&pn_seqnum=${mcNumber}`;
-    const res = await axios.get(url, { timeout: 15000, headers: { 'User-Agent': 'LoadTrackerPro-Outreach/1.0' } });
-    const html = res.data;
-
-    const extract = (label) => {
-      const regex = new RegExp(`${label}[^<]*<[^>]+>([^<]+)<`, 'i');
-      const m = html.match(regex);
-      return m ? m[1].trim() : null;
-    };
-
-    const phone = extract('Phone') || extract('Telephone');
-    const email = extract('Email');
-    const dot = extract('USDOT');
-    const trucks = parseInt(extract('Total Power Units') || '0') || null;
-
-    await pool.query(
-      `UPDATE carriers SET phone=$1, email=$2, dot_number=$3, truck_count=$4 WHERE id=$5`,
-      [phone, email, dot, trucks, carrierId]
-    );
-
-    // If we have an email and haven't contacted them yet, send outreach
-    if (email) {
-      const already = await pool.query(
-        `SELECT id FROM outreach_log WHERE carrier_id=$1 AND type='email'`, [carrierId]
-      );
-      if (already.rows.length === 0) {
-        const carrier = await pool.query(`SELECT * FROM carriers WHERE id=$1`, [carrierId]);
-        await sendOutreachEmail(carrier.rows[0]);
-      }
-    }
-  } catch (err) {
-    console.error(`[FMCSA] Detail fetch error for MC ${mcNumber}:`, err.message);
-  }
-}
 
 async function sendPendingFollowUps() {
   const result = await pool.query(`
