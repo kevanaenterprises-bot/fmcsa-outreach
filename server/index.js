@@ -315,6 +315,18 @@ app.get('/api/emailed', async (req, res) => {
   }
 });
 
+// Debug: check a specific DOT number against the FMCSA API
+app.get('/api/debug-dot/:dot', async (req, res) => {
+  const webKey = process.env.FMCSA_WEBKEY;
+  try {
+    const url = `${FMCSA_API}/carriers/${req.params.dot}?webKey=${webKey}`;
+    const r = await axios.get(url, { timeout: 10000 });
+    res.json({ url, data: r.data });
+  } catch (err) {
+    res.json({ url: `${FMCSA_API}/carriers/${req.params.dot}?webKey=${webKey}`, status: err.response?.status, message: err.message });
+  }
+});
+
 // Update call status
 app.patch('/api/carriers/:id/call-status', async (req, res) => {
   try {
