@@ -208,9 +208,12 @@ async function scrapePhoneFromSAFER(dotNumber) {
 
 // ── FMCSA Poller ──────────────────────────────────────────────────────────────
 const FMCSA_API = 'https://mobile.fmcsa.dot.gov/qc/services';
-// New carriers in 2026 are around DOT# 4,300,000+. Override with START_DOT_NUMBER env var.
-const DEFAULT_START_DOT = 4300000;
-const SCAN_BATCH = 200;
+// Jan 1 2026 ≈ DOT 4,260,000. Override with START_DOT_NUMBER env var.
+const DEFAULT_START_DOT = 4260000;
+// How many new carriers to add per poll. 4 polls/day × 6 = ~25/week.
+const CARRIERS_PER_POLL = parseInt(process.env.CARRIERS_PER_POLL) || 6;
+// Safety cap — max DOT numbers to scan in one poll to avoid runaway loops
+const MAX_SCAN_PER_POLL = 500;
 
 async function getLastScannedDOT() {
   const r = await pool.query(`SELECT MAX(CAST(dot_number AS BIGINT)) as max_dot FROM carriers WHERE dot_number ~ '^[0-9]+$'`);
@@ -227,11 +230,11 @@ async function pollFMCSA() {
 
   try {
     const startDOT = await getLastScannedDOT();
-    const endDOT = startDOT + SCAN_BATCH;
-    console.log(`[FMCSA] Scanning DOT# ${startDOT} → ${endDOT}`);
+    console.log(`[FMCSA] Scanning from DOT# ${startDOT} (target: ${CARRIERS_PER_POLL} new carriers)`);
 
     let found = 0;
-    for (let dot = startDOT; dot <= endDOT; dot++) {
+    let scanned = 0;
+    for (let dot = startDOT; found < CARRIERS_PER_POLL && scanned < MAX_SCAN_PER_POLL; dot++, scanned++) {
       try {
         const res = await axios.get(`${FMCSA_API}/carriers/${dot}?webKey=${webKey}`, { timeout: 10000 });
         const c = res.data?.content?.carrier;
@@ -267,7 +270,7 @@ async function pollFMCSA() {
       await new Promise(r => setTimeout(r, 150));
     }
 
-    console.log(`[FMCSA] Poll complete — ${found} new carriers found (scanned DOT ${startDOT}–${endDOT})`);
+    console.log(`[FMCSA] Poll complete — ${found} new carriers found (scanned ${scanned} DOT numbers from ${startDOT})`);
     await sendPendingFollowUps();
 
   } catch (err) {
