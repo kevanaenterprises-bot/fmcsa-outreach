@@ -213,33 +213,39 @@ async function pollFMCSA() {
     let found = 0;
     for (let dot = startDOT; dot <= endDOT; dot++) {
       try {
-        const url = `${FMCSA_API}/carriers/${dot}?webKey=${webKey}`;
-        const res = await axios.get(url, { timeout: 10000 });
-        const content = res.data?.content;
-        if (!content || content.length === 0) continue;
+        const res = await axios.get(`${FMCSA_API}/carriers/${dot}?webKey=${webKey}`, { timeout: 10000 });
+        const c = res.data?.content?.carrier;
+        if (!c) continue;
 
-        const c = Array.isArray(content) ? content[0] : content;
         const companyName = c.legalName || c.dbaName;
         if (!companyName) continue;
 
-        const email = c.emailAddress || null;
-        const phone = c.telephone || null;
-        const state = c.phyState || c.mailingState || null;
-        const city = c.phyCity || c.mailingCity || null;
-        const mc = c.docketNumber ? String(c.docketNumber) : null;
+        // Fetch basics for phone/email
+        let phone = null, email = null;
+        try {
+          const basicsRes = await axios.get(`${FMCSA_API}/carriers/${dot}/basics?webKey=${webKey}`, { timeout: 8000 });
+          const basics = basicsRes.data?.content?.basics || basicsRes.data?.content;
+          if (basics) {
+            phone = basics.telephone || basics.phoneNumber || null;
+            email = basics.emailAddress || basics.email || null;
+          }
+        } catch (_) {}
+
+        const state = c.phyState || null;
+        const city = c.phyCity || null;
         const trucks = c.totalPowerUnits ? parseInt(c.totalPowerUnits) : null;
 
         const result = await pool.query(
-          `INSERT INTO carriers (dot_number, mc_number, company_name, phone, email, city, state, truck_count, application_date)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+          `INSERT INTO carriers (dot_number, company_name, phone, email, city, state, truck_count, application_date)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
            ON CONFLICT (dot_number) DO NOTHING
            RETURNING id`,
-          [String(dot), mc, companyName, phone, email, city, state, trucks]
+          [String(dot), companyName, phone, email, city, state, trucks]
         );
 
         if (result.rows.length > 0) {
           found++;
-          console.log(`[FMCSA] New carrier: ${companyName} (DOT ${dot}${email ? ', has email' : ', no email'})`);
+          console.log(`[FMCSA] New: ${companyName} (DOT ${dot}${email ? ', email: ' + email : ', no email'})`);
           if (email) {
             const already = await pool.query(
               `SELECT id FROM outreach_log WHERE carrier_id=$1 AND type='email'`, [result.rows[0].id]
@@ -255,7 +261,7 @@ async function pollFMCSA() {
           console.error(`[FMCSA] DOT ${dot} error:`, err.message);
         }
       }
-      await new Promise(r => setTimeout(r, 100));
+      await new Promise(r => setTimeout(r, 150));
     }
 
     console.log(`[FMCSA] Poll complete — ${found} new carriers found (scanned DOT ${startDOT}–${endDOT})`);
@@ -318,12 +324,18 @@ app.get('/api/emailed', async (req, res) => {
 // Debug: check a specific DOT number against the FMCSA API
 app.get('/api/debug-dot/:dot', async (req, res) => {
   const webKey = process.env.FMCSA_WEBKEY;
+  const dot = req.params.dot;
   try {
-    const url = `${FMCSA_API}/carriers/${req.params.dot}?webKey=${webKey}`;
-    const r = await axios.get(url, { timeout: 10000 });
-    res.json({ url, data: r.data });
+    const [main, basics] = await Promise.allSettled([
+      axios.get(`${FMCSA_API}/carriers/${dot}?webKey=${webKey}`, { timeout: 10000 }),
+      axios.get(`${FMCSA_API}/carriers/${dot}/basics?webKey=${webKey}`, { timeout: 10000 }),
+    ]);
+    res.json({
+      carrier: main.status === 'fulfilled' ? main.value.data : { error: main.reason?.response?.status },
+      basics: basics.status === 'fulfilled' ? basics.value.data : { error: basics.reason?.response?.status },
+    });
   } catch (err) {
-    res.json({ url: `${FMCSA_API}/carriers/${req.params.dot}?webKey=${webKey}`, status: err.response?.status, message: err.message });
+    res.json({ status: err.response?.status, message: err.message });
   }
 });
 
